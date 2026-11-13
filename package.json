@@ -1,0 +1,38 @@
+{
+  "name": "helius-laserstream-indexer",
+  "version": "1.0.0",
+  "description": "Solana transaction and account indexer using Helius LaserStream gRPC on Devnet",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "test": "tsx test/db.test.ts",
+    "stats": "tsx -e \"import { DatabaseManager } from './src/db'; const db = new DatabaseManager(); db.init(); console.table(db.getStats()); db.close();\"",
+    "query:txs": "tsx -e \"import { DatabaseManager } from './src/db'; const db = new DatabaseManager(); db.init(); console.log(JSON.stringify(db.getRecentTransactions(5), null, 2)); db.close();\"",
+    "query:accounts": "tsx -e \"import { DatabaseManager } from './src/db'; const db = new DatabaseManager(); db.init(); console.log(JSON.stringify(db.getRecentAccounts(5), null, 2)); db.close();\"",
+    "postinstall": "node scripts/patch-laserstream.js"
+  },
+  "keywords": [
+    "solana",
+    "helius",
+    "laserstream",
+    "grpc",
+    "indexer",
+    "devnet",
+    "geyser"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@grpc/grpc-js": "^1.14.7",
+    "@grpc/proto-loader": "^0.8.1",
+    "@types/node": "^26.6.6",
+    "bs58": "^6.0.0",
+    "dotenv": "^18.0.10",
+    "helius-laserstream": "^2.0.0",
+    "tsx": "^4.23.15",
+    "typescript": "^5.8.2"
+  }
+}
