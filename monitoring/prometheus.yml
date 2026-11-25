@@ -1,0 +1,11 @@
+global:
+  scrape_interval: 2s
+  evaluation_interval: 2s
+
+scrape_configs:
+  - job_name: 'solana-microscope'
+    metrics_path: '/metrics'
+    static_configs:
+      # Use host.docker.internal when Prometheus runs in Docker and Microscope runs on Windows/macOS host.
+      # If running Prometheus natively on Windows without Docker, change this to localhost:3000.
+      - targets: ['host.docker.internal:3000']

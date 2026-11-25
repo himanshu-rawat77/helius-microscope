@@ -147,6 +147,30 @@ class LaserstreamClient {
       activeCall.on('error', (err) => {
         if (isCanceled) return;
 
+        // Handle OUT_OF_RANGE (gRPC code 11) when requested fromSlot was evicted from Helius buffer
+        if (err.code === 11 || (err.message && err.message.includes('OUT_OF_RANGE'))) {
+          const match = err.message.match(/oldest available slot (\\d+)/i);
+          if (match && match[1]) {
+            const minSlot = Number(match[1]);
+            console.warn(\`[Laserstream] Requested replay slot was evicted. Clamping fromSlot forward to oldest available slot: \${minSlot}\`);
+            lastSeenSlot = minSlot;
+            currentRequest.fromSlot = minSlot;
+          } else {
+            console.warn(\`[Laserstream] Requested replay slot was evicted. Resuming from live slot.\`);
+            delete currentRequest.fromSlot;
+            lastSeenSlot = null;
+          }
+          reconnectAttempts = 0;
+          setTimeout(() => {
+            if (!isCanceled) {
+              try { client.close(); } catch {}
+              client = new GeyserClientClass(target, sslCreds, grpcOptions);
+              connect();
+            }
+          }, 300);
+          return;
+        }
+
         if (err.code === grpc.status.UNAUTHENTICATED || err.code === grpc.status.INVALID_ARGUMENT) {
           if (callback) callback(err, null);
           return;

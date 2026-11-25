@@ -5,11 +5,18 @@ import { CommitmentLevel } from 'helius-laserstream';
 import { DatabaseManager } from './db';
 import { startLaserstreamSubscription } from './laserstream';
 import { IndexerConfig } from './types';
+import { MicroscopeIdlDecoder } from './microscope/idlDecoder';
+import { MicroscopeGovernanceTracker } from './microscope/governance';
+import { MicroscopeMetrics } from './microscope/metrics';
+import { MicroscopeServer } from './microscope/server';
+import fs from 'fs';
+import path from 'path';
 
-// Devnet endpoint per specification
-const DEVNET_ENDPOINT = 'https://laserstream-devnet-ewr.helius-rpc.com';
+// Helius LaserStream Regional Endpoints
+const LASERSTREAM_DEVNET_ENDPOINT = 'https://laserstream-devnet-ewr.helius-rpc.com';
+const LASERSTREAM_MAINNET_ENDPOINT = 'https://laserstream-mainnet-ewr.helius-rpc.com';
 
-// Default placeholder program ID: Solana SPL Memo Program on Devnet
+// Default placeholder program ID: Solana SPL Memo Program
 const DEFAULT_PROGRAM_ID = 'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr';
 
 const COMMITMENT_NAMES: Record<CommitmentLevel, string> = {
@@ -17,6 +24,18 @@ const COMMITMENT_NAMES: Record<CommitmentLevel, string> = {
   [CommitmentLevel.CONFIRMED]: 'CONFIRMED',
   [CommitmentLevel.FINALIZED]: 'FINALIZED',
 };
+
+function parseAddressList(raw?: string): string[] {
+  if (!raw) return [];
+  return Array.from(
+    new Set(
+      raw
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean)
+    )
+  );
+}
 
 function parseCommitment(val?: string): CommitmentLevel {
   const normalized = (val || '').trim().toUpperCase();
@@ -32,9 +51,9 @@ function parseCommitment(val?: string): CommitmentLevel {
 }
 
 async function main() {
-  console.log('='.repeat(70));
-  console.log('       HELIUS LASERSTREAM SOLANA DEVNET INDEXER       ');
-  console.log('='.repeat(70));
+  console.log('='.repeat(72));
+  console.log('        SOLANA MICROSCOPE LOCAL & HELIUS LASERSTREAM INDEXER        ');
+  console.log('='.repeat(72));
 
   const apiKey = process.env.HELIUS_API_KEY;
   if (!apiKey || apiKey === 'your_helius_api_key_here') {
@@ -45,59 +64,120 @@ async function main() {
     process.exit(1);
   }
 
-  const endpoint = process.env.HELIUS_ENDPOINT || DEVNET_ENDPOINT;
-  const programId = process.env.PROGRAM_ID || DEFAULT_PROGRAM_ID;
+  // Parse Target Network (devnet | mainnet)
+  const networkRaw = (process.env.NETWORK || 'devnet').trim().toLowerCase();
+  const network: 'mainnet' | 'devnet' =
+    networkRaw === 'mainnet' || networkRaw === 'mainnet-beta' ? 'mainnet' : 'devnet';
+
+  const defaultEndpoint = network === 'mainnet' ? LASERSTREAM_MAINNET_ENDPOINT : LASERSTREAM_DEVNET_ENDPOINT;
+  const endpoint = process.env.HELIUS_ENDPOINT || defaultEndpoint;
+  const parsedProgramIds = parseAddressList(process.env.PROGRAM_IDS || process.env.PROGRAM_ID);
+  const programIds = parsedProgramIds.length > 0 ? parsedProgramIds : [DEFAULT_PROGRAM_ID];
+  const programId = programIds[0];
+  const multisigAddresses = parseAddressList(process.env.MULTISIG_ADDRESSES);
   const commitment = parseCommitment(process.env.COMMITMENT);
   const dbPath = process.env.DATABASE_PATH || './indexer.db';
   const replay = process.env.REPLAY !== 'false';
   const intraSlotUpdates = process.env.INTRA_SLOT_UPDATES === 'true';
+  const microscopePort = parseInt(process.env.MICROSCOPE_PORT || '3000', 10);
+  const idlPath = process.env.IDL_PATH || './idl.json';
+  const rpcFailoverEnabled = process.env.RPC_FAILOVER_ENABLED !== 'false';
+  const rpcEndpoint = process.env.HELIUS_RPC_URL || undefined;
+  const rpcPollIntervalMs = parseInt(process.env.RPC_POLL_INTERVAL_MS || '3000', 10);
 
   const config: IndexerConfig = {
+    network,
     heliusApiKey: apiKey,
     endpoint,
     programId,
+    programIds,
+    multisigAddresses,
     commitment,
     dbPath,
     maxReconnectAttempts: 15,
     replay,
     intraSlotUpdates,
+    microscopePort,
+    idlPath,
+    rpcFailoverEnabled,
+    rpcEndpoint,
+    rpcPollIntervalMs,
   };
 
-  console.log(`[Config] Target Endpoint  : ${config.endpoint}`);
-  console.log(`[Config] Target Program ID: ${config.programId}`);
-  console.log(`[Config] Commitment Level : ${COMMITMENT_NAMES[config.commitment]}`);
-  console.log(`[Config] Database Path    : ${config.dbPath}`);
-  console.log(`[Config] Replay Resiliency: ${config.replay}`);
-  console.log('='.repeat(70));
-
-  // Initialize SQLite database
+  // 1. Initialize SQLite Database
   const db = new DatabaseManager(config.dbPath);
   db.init();
 
-  const initialStats = db.getStats();
+  const initialStats = db.getMetricsAggregate();
   console.log(
-    `[Database] Initialized. Current store: ${initialStats.transactionsCount} txs, ` +
-    `${initialStats.accountsCount} accounts. Last slot: ${initialStats.latestSlot}`
+    `[Database] Initialized. Stored: ${initialStats.transactionsCount} txs, ` +
+    `${initialStats.accountsCount} accounts, ${initialStats.governanceCount || 0} governance events.`
   );
 
-  // Start subscription stream
+  // 2. Initialize Microscope Components
+  const idlDecoder = new MicroscopeIdlDecoder();
+  if (fs.existsSync(config.idlPath!)) {
+    idlDecoder.loadIdlFromFile(path.resolve(config.idlPath!));
+  } else {
+    console.log(`[Microscope IDL] No local idl.json found. You can upload/paste one directly on the dashboard.`);
+  }
+
+  const governanceTracker = new MicroscopeGovernanceTracker();
+  governanceTracker.initFromDatabase(db.getRecentGovernanceEvents());
+
+  const metrics = new MicroscopeMetrics();
+  metrics.initFromDatabase(initialStats);
+
+  const microscopeServer = new MicroscopeServer(
+    idlDecoder,
+    governanceTracker,
+    metrics,
+    db,
+    config.programIds || [config.programId],
+    config.endpoint,
+    config.network,
+    config.microscopePort,
+    config.multisigAddresses || []
+  );
+  await microscopeServer.start();
+
+  console.log(`[Config] Target Cluster   : ${config.network.toUpperCase()} (${config.network === 'mainnet' ? 'Solana Mainnet-Beta' : 'Solana Devnet'})`);
+  console.log(`[Config] Target Endpoint  : ${config.endpoint}`);
+  console.log(`[Config] Target Programs  : ${(config.programIds || [config.programId]).join(', ')}`);
+  if (config.multisigAddresses && config.multisigAddresses.length > 0) {
+    console.log(`[Config] Multisig Targets : ${config.multisigAddresses.join(', ')}`);
+  }
+  console.log(`[Config] RPC Failover     : ${config.rpcFailoverEnabled ? `Enabled (${config.rpcPollIntervalMs}ms poll)` : 'Disabled'}`);
+  console.log(`[Config] Commitment Level : ${COMMITMENT_NAMES[config.commitment]}`);
+  console.log(`[Config] Database Path    : ${config.dbPath}`);
+  console.log(`[Config] Replay Resiliency: ${config.replay}`);
+  console.log('='.repeat(72));
+
+  // 3. Start Helius LaserStream gRPC Subscription
   let subscription: { stream: any; stop: () => void };
   try {
-    subscription = await startLaserstreamSubscription(config, db);
+    subscription = await startLaserstreamSubscription(config, db, {
+      idlDecoder,
+      governance: governanceTracker,
+      metrics,
+      server: microscopeServer,
+    });
   } catch (err: any) {
     console.error('[Error] Failed to initialize Laserstream subscription:', err.message);
+    microscopeServer.stop();
     db.close();
     process.exit(1);
   }
 
   // Periodic statistics reporter (every 20 seconds)
   const statsInterval = setInterval(() => {
-    const stats = db.getStats();
+    const summary = metrics.getSummary();
     console.log(
-      `[Stats] Transactions: ${stats.transactionsCount} | ` +
-      `Accounts: ${stats.accountsCount} | ` +
-      `Latest Slot: ${stats.latestSlot} | ` +
-      `Last Update: ${stats.lastUpdateAt || 'none'}`
+      `[Microscope Stats] Txs: ${summary.totalTransactions} | ` +
+      `Failed: ${summary.totalFailed} (${summary.successRate}%) | ` +
+      `TPS: ${summary.tps} | ` +
+      `Avg CU: ${summary.avgComputeUnits.toLocaleString()} | ` +
+      `Gov Events: ${summary.governanceEventsCount}`
     );
   }, 20000);
 
@@ -107,8 +187,15 @@ async function main() {
     if (isShuttingDown) return;
     isShuttingDown = true;
 
-    console.log(`\n[Shutdown] Received ${signal}. Gracefully stopping indexer...`);
+    console.log(`\n[Shutdown] Received ${signal}. Gracefully stopping Microscope Local...`);
     clearInterval(statsInterval);
+
+    try {
+      microscopeServer.stop();
+      console.log('[Shutdown] Microscope local server stopped.');
+    } catch (err: any) {
+      console.error('[Shutdown] Error stopping web server:', err.message);
+    }
 
     try {
       subscription.stop();
@@ -124,7 +211,7 @@ async function main() {
       console.error('[Shutdown] Error closing database:', err.message);
     }
 
-    console.log('[Shutdown] Indexer stopped cleanly.');
+    console.log('[Shutdown] Microscope Local stopped cleanly.');
     process.exit(0);
   };
 

@@ -1,14 +1,19 @@
 {
   "name": "helius-laserstream-indexer",
   "version": "1.0.0",
-  "description": "Solana transaction and account indexer using Helius LaserStream gRPC on Devnet",
+  "description": "Local-first Solana Microscope & Helius LaserStream gRPC indexer with multi-program/multisig monitoring, RPC failover, Anchor IDL decoding, and Prometheus/Grafana telemetry",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "engines": {
+    "node": ">=22.5.0"
+  },
   "scripts": {
     "start": "tsx src/index.ts",
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
     "test": "tsx test/db.test.ts",
+    "test:microscope": "tsx test/microscope.test.ts",
+    "test:all": "npm run build && npm test && npm run test:microscope",
     "stats": "tsx -e \"import { DatabaseManager } from './src/db'; const db = new DatabaseManager(); db.init(); console.table(db.getStats()); db.close();\"",
     "query:txs": "tsx -e \"import { DatabaseManager } from './src/db'; const db = new DatabaseManager(); db.init(); console.log(JSON.stringify(db.getRecentTransactions(5), null, 2)); db.close();\"",
     "query:accounts": "tsx -e \"import { DatabaseManager } from './src/db'; const db = new DatabaseManager(); db.init(); console.log(JSON.stringify(db.getRecentAccounts(5), null, 2)); db.close();\"",
@@ -26,8 +31,11 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
+    "@coral-xyz/anchor": "^0.32.1",
+    "@coral-xyz/borsh": "^0.32.1",
     "@grpc/grpc-js": "^1.14.7",
     "@grpc/proto-loader": "^0.8.1",
+    "@solana/web3.js": "^1.99.0",
     "@types/node": "^26.6.6",
     "bs58": "^6.0.0",
     "dotenv": "^18.0.10",

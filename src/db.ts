@@ -1,5 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
-import { ParsedTransaction, ParsedAccountUpdate, IndexerStats } from './types';
+import { ParsedTransaction, ParsedAccountUpdate, IndexerStats, GovernanceEvent } from './types';
 import path from 'path';
 import fs from 'fs';
 
@@ -46,6 +46,7 @@ export class DatabaseManager {
         accounts TEXT NOT NULL,
         instructions TEXT NOT NULL,
         log_messages TEXT NOT NULL,
+        decoded_events TEXT,
         created_at TEXT NOT NULL
       );
 
@@ -70,7 +71,24 @@ export class DatabaseManager {
       CREATE INDEX IF NOT EXISTS idx_accounts_pubkey ON accounts(pubkey);
       CREATE INDEX IF NOT EXISTS idx_accounts_owner ON accounts(owner);
       CREATE INDEX IF NOT EXISTS idx_accounts_slot ON accounts(slot);
+
+      CREATE TABLE IF NOT EXISTS governance_events (
+        signature TEXT PRIMARY KEY,
+        slot INTEGER NOT NULL,
+        type TEXT NOT NULL,
+        description TEXT NOT NULL,
+        details TEXT NOT NULL,
+        timestamp TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_governance_slot ON governance_events(slot);
     `);
+
+    // Migrate existing databases created before decoded_events was added
+    const txColumns = this.db.prepare('PRAGMA table_info(transactions)').all() as Array<{ name: string }>;
+    if (!txColumns.some((col) => col.name === 'decoded_events')) {
+      this.db.exec('ALTER TABLE transactions ADD COLUMN decoded_events TEXT;');
+    }
   }
 
   private getDatabase(): DatabaseSync {
@@ -89,14 +107,16 @@ export class DatabaseManager {
     const stmt = db.prepare(`
       INSERT INTO transactions (
         signature, slot, block_time, err, fee, compute_units_consumed,
-        recent_blockhash, accounts, instructions, log_messages, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        recent_blockhash, accounts, instructions, log_messages, decoded_events, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(signature) DO UPDATE SET
         slot = excluded.slot,
         err = excluded.err,
         fee = excluded.fee,
         compute_units_consumed = excluded.compute_units_consumed,
-        log_messages = excluded.log_messages
+        instructions = excluded.instructions,
+        log_messages = excluded.log_messages,
+        decoded_events = excluded.decoded_events
     `);
 
     const result = stmt.run(
@@ -110,6 +130,7 @@ export class DatabaseManager {
       JSON.stringify(tx.accounts),
       JSON.stringify(tx.instructions),
       JSON.stringify(tx.logMessages),
+      tx.decodedEvents ? JSON.stringify(tx.decodedEvents) : null,
       tx.createdAt
     ) as { changes?: number };
 
@@ -154,6 +175,26 @@ export class DatabaseManager {
     this.updateLatestSlot(account.slot);
 
     return Boolean(result && result.changes && result.changes > 0);
+  }
+
+  /**
+   * Persists a governance / program upgrade event.
+   */
+  public saveGovernanceEvent(event: GovernanceEvent): void {
+    const db = this.getDatabase();
+    const stmt = db.prepare(`
+      INSERT INTO governance_events (signature, slot, type, description, details, timestamp)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(signature) DO NOTHING
+    `);
+    stmt.run(
+      event.signature,
+      event.slot,
+      event.type,
+      event.description,
+      JSON.stringify(event.details),
+      event.timestamp
+    );
   }
 
   /**
@@ -206,24 +247,104 @@ export class DatabaseManager {
     const db = this.getDatabase();
     const txRow = db.prepare('SELECT COUNT(*) as count FROM transactions').get() as { count: number };
     const accRow = db.prepare('SELECT COUNT(*) as count FROM accounts').get() as { count: number };
+    const govRow = db.prepare('SELECT COUNT(*) as count FROM governance_events').get() as { count: number };
     const latestSlot = this.getLatestSlot() || 0;
     const lastUpdateAt = this.getMetadata('last_update_at');
 
     return {
       transactionsCount: txRow ? txRow.count : 0,
       accountsCount: accRow ? accRow.count : 0,
+      governanceCount: govRow ? govRow.count : 0,
       latestSlot,
       lastUpdateAt,
     };
   }
 
   /**
+   * Computes full historical metric aggregates from SQLite for accurate dashboard hydration.
+   */
+  public getMetricsAggregate() {
+    const db = this.getDatabase();
+    const stats = this.getStats();
+    const agg = db
+      .prepare(
+        `SELECT
+          SUM(CASE WHEN err IS NOT NULL AND err != 'null' THEN 1 ELSE 0 END) as failedCount,
+          COALESCE(SUM(fee), 0) as totalFeeLamports,
+          COALESCE(SUM(compute_units_consumed), 0) as totalComputeUnits,
+          COALESCE(MAX(compute_units_consumed), 0) as maxComputeUnits,
+          MAX(created_at) as lastTxAt
+        FROM transactions`
+      )
+      .get() as {
+      failedCount: number | null;
+      totalFeeLamports: number;
+      totalComputeUnits: number;
+      maxComputeUnits: number;
+      lastTxAt: string | null;
+    };
+
+    return {
+      ...stats,
+      failedCount: agg?.failedCount || 0,
+      totalFeeLamports: agg?.totalFeeLamports || 0,
+      totalComputeUnits: agg?.totalComputeUnits || 0,
+      maxComputeUnits: agg?.maxComputeUnits || 0,
+      lastTxAt: agg?.lastTxAt || stats.lastUpdateAt || null,
+    };
+  }
+
+  /**
    * Fetches recent transactions for inspection or logging.
    */
-  public getRecentTransactions(limit: number = 10): any[] {
+  public getRecentTransactions(limit: number = 50): any[] {
     const db = this.getDatabase();
     const stmt = db.prepare(`SELECT * FROM transactions ORDER BY slot DESC, created_at DESC LIMIT ?`);
-    return stmt.all(limit);
+    const rows = stmt.all(limit) as any[];
+    return rows.map((r) => {
+      let accounts = [];
+      let instructions = [];
+      let logMessages = [];
+      let decodedEvents = undefined;
+      try {
+        accounts = JSON.parse(r.accounts || '[]');
+        instructions = JSON.parse(r.instructions || '[]');
+        logMessages = JSON.parse(r.log_messages || '[]');
+        if (r.decoded_events) decodedEvents = JSON.parse(r.decoded_events);
+      } catch {}
+
+      return {
+        signature: r.signature,
+        slot: r.slot,
+        blockTime: r.block_time,
+        err: r.err,
+        fee: r.fee,
+        computeUnitsConsumed: r.compute_units_consumed,
+        recentBlockhash: r.recent_blockhash,
+        accounts,
+        instructions,
+        logMessages,
+        decodedEvents,
+        createdAt: r.created_at,
+      };
+    });
+  }
+
+  /**
+   * Fetches recent governance / BPF upgrade events.
+   */
+  public getRecentGovernanceEvents(limit: number = 20): GovernanceEvent[] {
+    const db = this.getDatabase();
+    const stmt = db.prepare(`SELECT * FROM governance_events ORDER BY slot DESC, timestamp DESC LIMIT ?`);
+    const rows = stmt.all(limit) as any[];
+    return rows.map((r) => ({
+      type: r.type,
+      signature: r.signature,
+      slot: r.slot,
+      description: r.description,
+      details: JSON.parse(r.details || '{}'),
+      timestamp: r.timestamp,
+    }));
   }
 
   /**
